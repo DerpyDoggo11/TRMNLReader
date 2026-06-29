@@ -4,14 +4,14 @@
 EPaper epd;             // a full-screen drawing buffer for the panel
 
 void setup() {
+
   Serial.begin(115200);
   delay(1000);
+  
+  epd.begin();
+  epd.setRotation(0); 
 
-  epd.begin();                 // init SPI + panel
-  epd.setRotation(0);          // landscape: 800 wide x 480 tall
-
-  // --- everything below draws into a buffer; nothing shows yet ---
-  epd.fillScreen(TFT_WHITE);   // clear buffer to white
+  epd.fillScreen(TFT_WHITE);
 
   // Text  (drawString args: text, x, y, font number)
   epd.setTextColor(TFT_BLACK);
