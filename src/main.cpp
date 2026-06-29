@@ -500,13 +500,19 @@ static void drawError(const String& msg) {
 }
 
 static bool connectWiFi() {
+  Serial.printf("[wifi] connecting to SSID '%s'\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED) {
-    if (millis() - start > 30000) return false;
+    if (millis() - start > 30000) {
+      Serial.printf("[wifi] failed, status=%d\n", WiFi.status());
+      return false;
+    }
     delay(200);
   }
+  Serial.printf("[wifi] ok, ip=%s rssi=%d\n",
+                WiFi.localIP().toString().c_str(), WiFi.RSSI());
   return true;
 }
 
