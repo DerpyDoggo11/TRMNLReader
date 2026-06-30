@@ -1,22 +1,17 @@
 // trmnlreader — Seeed XIAO ESP32-S3 + 7.5" e-paper kit
 //
-// Server (TRMNLReaderServer/) renders PDF pages at fill-width — width is
-// always 800 px, height is whatever the page works out to (padded to >= 480).
-// Body is a 1-bit packed bitmap, MSB-first, 1 = white. Device shows a 480-row
-// viewport at a configurable scrollY, advancing through the page on
-// short-press and through pages on long-press.
+// Server (TRMNLReaderServer/) renders PDF pages at fill-width. Bitmap width
+// matches the device's active orientation (800 px landscape, 480 px portrait)
+// and height is whatever the page works out to (padded to >= viewport).
+// Body is a 1-bit packed bitmap, MSB-first, 1 = white.
 //
 // Buttons (active-low, INPUT_PULLUP):
-//   BTN_SELECT  short = open hovered book in dashboard (no-op in reader)
-//               long  = close book and return to dashboard
-//   BTN_PREV    short = dashboard: cursor left ;  reader: scroll up
-//               long  = dashboard: noop        ;  reader: previous page
-//   BTN_NEXT    short = dashboard: cursor right;  reader: scroll down
-//               long  = dashboard: noop        ;  reader: next page
-//
-// Pin numbers below are best-guess; the firmware probes all four free GPIOs
-// (D4–D7) on boot and prints which one fires when a button is pressed, so
-// you can re-map BTN_SELECT/BTN_PREV/BTN_NEXT if needed.
+//   BTN_SELECT  short = dashboard: open hovered book ;  reader: exit to dash
+//               long  = toggle orientation (landscape <-> portrait)
+//   BTN_PREV    short = dashboard: cursor left       ;  reader: scroll up
+//               long  = dashboard: previous 8 books  ;  reader: previous page
+//   BTN_NEXT    short = dashboard: cursor right      ;  reader: scroll down
+//               long  = dashboard: next 8 books      ;  reader: next page
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -51,34 +46,55 @@
 #define READER_LONG_PRESS_MS 600
 #endif
 
-#define BTN_SELECT D4
-#define BTN_PREV   D5
-#define BTN_NEXT   D6
+#define BTN_SELECT 2
+#define BTN_PREV   3
+#define BTN_NEXT   5
 
 // ---------------------------------------------------------------------------
-// Display constants (must match server-side pdfRender.ts)
+// Display constants
 // ---------------------------------------------------------------------------
-static constexpr int SCREEN_W   = 800;
-static constexpr int SCREEN_H   = 480;
-static constexpr int ROW_BYTES  = SCREEN_W / 8;        // 100
+// Native panel resolution is 800 × 480. Long edge → landscape width / portrait
+// height, short edge → landscape height / portrait width.
+static constexpr int PANEL_LONG  = 800;
+static constexpr int PANEL_SHORT = 480;
 
-static constexpr int COVER_W   = 160;
-static constexpr int COVER_H   = 224;
+static constexpr int COVER_W   = 120;
+static constexpr int COVER_H   = 160;
 static constexpr size_t COVER_BYTES = (COVER_W * COVER_H) / 8;
 
 static constexpr int MAX_BOOKS = 32;
-static constexpr int GRID_COLS = 4;
-static constexpr int GRID_ROWS = 2;
-static constexpr int GRID_PAGE = GRID_COLS * GRID_ROWS;
 
-// scroll step inside a page (a bit less than a full screenful so context
-// carries over between presses).
-static constexpr int SCROLL_STEP = 380;
+// Scroll step a bit less than a full viewport so context carries over.
+static constexpr int SCROLL_STEP_LANDSCAPE = 380;
+static constexpr int SCROLL_STEP_PORTRAIT  = 680;
 
 // ---------------------------------------------------------------------------
 // Globals
 // ---------------------------------------------------------------------------
 EPaper epd;
+
+enum class Orientation { Landscape, Portrait };
+Orientation orientation = Orientation::Landscape;
+
+static int currentScreenW() {
+  return orientation == Orientation::Portrait ? PANEL_SHORT : PANEL_LONG;
+}
+static int currentScreenH() {
+  return orientation == Orientation::Portrait ? PANEL_LONG : PANEL_SHORT;
+}
+static int currentRowBytes() { return currentScreenW() / 8; }
+static int currentScrollStep() {
+  return orientation == Orientation::Portrait
+             ? SCROLL_STEP_PORTRAIT
+             : SCROLL_STEP_LANDSCAPE;
+}
+static int gridCols() {
+  return orientation == Orientation::Portrait ? 2 : 4;
+}
+static int gridRows() {
+  return orientation == Orientation::Portrait ? 4 : 2;
+}
+static int gridPageSize() { return gridCols() * gridRows(); }
 
 struct Book {
   String   id;
@@ -87,8 +103,8 @@ struct Book {
   int      pageCount    = 0;
   int      currentPage  = 0;
   uint32_t secondsRead  = 0;
-  bool     available    = false;     // we have a file OR can fetch one
-  uint8_t* cover        = nullptr;   // COVER_BYTES, PSRAM
+  bool     available    = false;
+  uint8_t* cover        = nullptr;
 };
 Book books[MAX_BOOKS];
 int bookCount   = 0;
@@ -97,11 +113,10 @@ int selectedIdx = 0;
 enum class Screen { Boot, Dashboard, Reader, Error };
 Screen screen = Screen::Boot;
 
-// Variable-height page bitmap cache. Each slot has its own size.
 struct PageSlot {
   int      page     = -1;
-  int      height   = 0;            // rows (each row = ROW_BYTES)
-  size_t   capacity = 0;            // allocated bytes
+  int      height   = 0;
+  size_t   capacity = 0;
   uint8_t* data     = nullptr;
 };
 static constexpr int CACHE_SLOTS = READER_PREFETCH_PAGES + 2;
@@ -136,30 +151,11 @@ BtnState btn[3] = {
   {BTN_NEXT,   false, 0, false},
 };
 
-// Extra probe — these are the *other* candidate pins (D4–D7) that aren't
-// already in btn[]. On press they print to serial so you can identify the
-// real button-to-pin mapping for your kit and update BTN_* above.
-static const uint8_t PROBE_PINS[] = {D4, D5, D6, D7};
-static bool probeLastState[4]      = {true, true, true, true};
-
 static void buttonsInit() {
   for (auto& b : btn) pinMode(b.pin, INPUT_PULLUP);
-  for (auto p : PROBE_PINS) pinMode(p, INPUT_PULLUP);
-}
-
-static void pollProbe() {
-  for (int i = 0; i < (int)(sizeof(PROBE_PINS) / sizeof(PROBE_PINS[0])); i++) {
-    bool now = digitalRead(PROBE_PINS[i]);
-    if (now != probeLastState[i]) {
-      probeLastState[i] = now;
-      if (!now) Serial.printf("[probe] D%d (GPIO%d) pressed\n",
-                              i + 4, PROBE_PINS[i]);
-    }
-  }
 }
 
 static BtnEvent pollButtons() {
-  pollProbe();
   for (int i = 0; i < 3; i++) {
     auto& b = btn[i];
     bool pressed = digitalRead(b.pin) == LOW;
@@ -168,16 +164,20 @@ static BtnEvent pollButtons() {
     } else if (pressed && b.down && !b.longFired) {
       if (millis() - b.downAt >= READER_LONG_PRESS_MS) {
         b.longFired = true;
-        if (i == 0) return BtnEvent::SelectLong;
-        if (i == 1) return BtnEvent::PrevLong;
-        return BtnEvent::NextLong;
+        switch (i) {
+          case 0: return BtnEvent::SelectLong;
+          case 1: return BtnEvent::PrevLong;
+          case 2: return BtnEvent::NextLong;
+        }
       }
     } else if (!pressed && b.down) {
       b.down = false;
       if (!b.longFired) {
-        if (i == 0) return BtnEvent::SelectShort;
-        if (i == 1) return BtnEvent::PrevShort;
-        return BtnEvent::NextShort;
+        switch (i) {
+          case 0: return BtnEvent::SelectShort;
+          case 1: return BtnEvent::PrevShort;
+          case 2: return BtnEvent::NextShort;
+        }
       }
     }
   }
@@ -198,7 +198,6 @@ static WiFiClient& clientFor(const String& url) {
   return plainClient;
 }
 
-// Stream the body straight into `out` (caller-allocated, exact size).
 static bool httpFetchBytes(const String& path, uint8_t* out, size_t expected) {
   String url = String(SERVER_URL) + path;
   HTTPClient http;
@@ -240,9 +239,6 @@ static bool httpFetchBytes(const String& path, uint8_t* out, size_t expected) {
   return true;
 }
 
-// Variant that allocates based on Content-Length and reads the variable-size
-// page bitmap. Sets *outHeight from the X-Image-Height header (or computes
-// it from Content-Length / ROW_BYTES if the header is missing).
 static const char* PAGE_HEADERS[] = {"X-Image-Height", "X-Page-Count"};
 static bool httpFetchPage(const String& path, PageSlot* slot, int* outPageCount) {
   String url = String(SERVER_URL) + path;
@@ -260,9 +256,10 @@ static bool httpFetchPage(const String& path, PageSlot* slot, int* outPageCount)
     return false;
   }
 
+  int rb = currentRowBytes();
   int contentLen = http.getSize();
   int height = http.header("X-Image-Height").toInt();
-  if (height <= 0 && contentLen > 0) height = contentLen / ROW_BYTES;
+  if (height <= 0 && contentLen > 0) height = contentLen / rb;
   if (height <= 0 || height > 5000) {
     Serial.printf("[http] bad height %d (clen=%d)\n", height, contentLen);
     http.end();
@@ -273,7 +270,7 @@ static bool httpFetchPage(const String& path, PageSlot* slot, int* outPageCount)
     if (pc > 0) *outPageCount = pc;
   }
 
-  size_t need = (size_t)height * ROW_BYTES;
+  size_t need = (size_t)height * rb;
   if (slot->capacity < need) {
     if (slot->data) free(slot->data);
     slot->data = (uint8_t*)heap_caps_malloc(need, MALLOC_CAP_SPIRAM);
@@ -362,7 +359,6 @@ static int cacheFind(int page) {
   return -1;
 }
 
-// Evict slot whose page is furthest from `keepNear`. Empty slots win.
 static int cacheEvictSlot(int keepNear) {
   int best = 0, bestDist = -1;
   for (int i = 0; i < CACHE_SLOTS; i++) {
@@ -379,7 +375,9 @@ static int cacheLoad(int page) {
   int slot = cacheEvictSlot(page);
   pageCache[slot].page = -1;
   String pathStr = String("/api/device/books/") + books[readerBookIdx].id +
-                   "/page/" + page;
+                   "/page/" + page +
+                   "?w=" + currentScreenW() +
+                   "&h=" + currentScreenH();
   int pageCount = 0;
   if (!httpFetchPage(pathStr, &pageCache[slot], &pageCount)) return -1;
   pageCache[slot].page = page;
@@ -433,7 +431,7 @@ static void loadCover(Book& b) {
   if (!b.cover) return;
   String path = "/api/device/books/" + b.id + "/cover";
   if (!httpFetchBytes(path, b.cover, COVER_BYTES)) {
-    memset(b.cover, 0xFF, COVER_BYTES);  // blank placeholder
+    memset(b.cover, 0xFF, COVER_BYTES);
   }
 }
 
@@ -461,8 +459,6 @@ static String formatDuration(uint32_t secs) {
 static void drawCard(int idx, int x, int y, int w, int h, bool selected) {
   Book& b = books[idx];
 
-  // Outline: a clean 2 px border. For the selected card, draw two nested
-  // rects so the hover indicator is unmistakable on e-paper.
   if (selected) {
     epd.drawRect(x - 6, y - 6, w + 12, h + 12, TFT_BLACK);
     epd.drawRect(x - 5, y - 5, w + 10, h + 10, TFT_BLACK);
@@ -472,7 +468,7 @@ static void drawCard(int idx, int x, int y, int w, int h, bool selected) {
   epd.drawRect(x, y, w, h, TFT_BLACK);
 
   int coverX = x + (w - COVER_W) / 2;
-  int coverY = y + 10;
+  int coverY = y + 8;
   if (b.cover) {
     epd.drawBitmap(coverX, coverY, b.cover, COVER_W, COVER_H,
                    TFT_WHITE, TFT_BLACK);
@@ -480,85 +476,96 @@ static void drawCard(int idx, int x, int y, int w, int h, bool selected) {
     epd.drawRect(coverX, coverY, COVER_W, COVER_H, TFT_BLACK);
   }
   if (!b.available) {
-    // diagonal stripes hint that the book can't be opened
     for (int i = 0; i < COVER_H; i += 8) {
       epd.drawLine(coverX, coverY + i, coverX + COVER_W, coverY + i, TFT_BLACK);
     }
   }
 
-  int maxChars = w / 7;
-  int textY = coverY + COVER_H + 8;
+  int maxChars = max(8, w / 7);
+  int textY = coverY + COVER_H + 4;
   epd.setTextColor(TFT_BLACK);
-  epd.drawString(truncToWidth(b.title, maxChars), x + 8, textY, 2);
-  if (b.author.length()) {
-    epd.drawString(truncToWidth(b.author, maxChars), x + 8, textY + 18, 2);
-  }
+  epd.drawString(truncToWidth(b.title, maxChars), x + 6, textY, 2);
 }
 
-static void drawHoverPanel(int x, int y, int w, int h) {
+// Slim one-line hover bar at the bottom — keeps the grid the dominant element
+// of the dashboard. Shows the selected book's title and (page progress, time
+// read) compactly.
+static void drawHoverBar(int x, int y, int w, int h) {
   if (bookCount == 0) return;
   Book& b = books[selectedIdx];
   epd.drawRect(x, y, w, h, TFT_BLACK);
   epd.setTextColor(TFT_BLACK);
 
-  // Title row (truncated to fit)
-  int maxChars = w / 8;
-  epd.drawString(truncToWidth(b.title, maxChars), x + 12, y + 10, 4);
+  int titleChars = w / 12;
+  epd.drawString(truncToWidth(b.title, titleChars), x + 10, y + 8, 4);
 
-  // Stats row
   String stats;
   if (b.pageCount > 0) {
     int pct = (int)((b.currentPage * 100L) / b.pageCount);
-    stats = "page " + String(b.currentPage) + " / " + String(b.pageCount) +
-            "  (" + String(pct) + "%)";
+    stats = "p." + String(b.currentPage) + "/" + String(b.pageCount) +
+            " (" + String(pct) + "%)  " + formatDuration(b.secondsRead);
   } else if (b.currentPage > 0) {
-    stats = "page " + String(b.currentPage);
+    stats = "p." + String(b.currentPage) + "  " +
+            formatDuration(b.secondsRead);
   } else {
-    stats = b.available ? "not started" : "unavailable on device";
+    stats = b.available ? "not started" : "unavailable";
   }
-  epd.drawString(stats, x + 12, y + 44, 2);
-
-  String time = "read for " + formatDuration(b.secondsRead);
-  epd.drawString(time, x + 12, y + 64, 2);
+  // Right-justify-ish: anchor near the right edge.
+  int statsChars = stats.length();
+  int statsX = x + w - statsChars * 8 - 12;
+  if (statsX < x + 10 + titleChars * 12 + 10) statsX = x + 10 + titleChars * 12 + 10;
+  epd.drawString(stats, statsX, y + 14, 2);
 }
 
 static void drawDashboard() {
   epd.fillScreen(TFT_WHITE);
   epd.setTextColor(TFT_BLACK);
-  epd.drawString("trmnl - reader", 24, 16, 4);
-  epd.drawLine(24, 48, SCREEN_W - 24, 48, TFT_BLACK);
+  int W = currentScreenW();
+  int H = currentScreenH();
+
+  // Slim top bar — title + page-of-pages indicator.
+  epd.drawString("trmnl - reader", 16, 8, 4);
+  int pageOfBooks = (selectedIdx / gridPageSize()) + 1;
+  int totalPages  = bookCount > 0
+                      ? ((bookCount - 1) / gridPageSize() + 1)
+                      : 1;
+  String posTop = String(selectedIdx + 1) + "/" + bookCount +
+                  "  pg " + pageOfBooks + "/" + totalPages;
+  epd.drawString(posTop, W - 200, 14, 2);
+  epd.drawLine(16, 36, W - 16, 36, TFT_BLACK);
 
   if (bookCount == 0) {
-    epd.drawString("No books yet — upload from the web dashboard.",
-                   24, 200, 4);
+    epd.drawString("No books yet - upload from the web dashboard.",
+                   24, H / 2, 4);
     epd.update();
     return;
   }
 
-  // Grid takes the top portion; bottom 92 px is the hover info panel.
-  int gridTop    = 60;
-  int gridBottom = SCREEN_H - 92;
-  int cellW      = (SCREEN_W - 24 * 2 - (GRID_COLS - 1) * 16) / GRID_COLS;
-  int cellH      = (gridBottom - gridTop - (GRID_ROWS - 1) * 16) / GRID_ROWS;
-  int originX    = 24;
-  int originY    = gridTop;
+  int cols = gridCols();
+  int rows = gridRows();
+  int gridPage = cols * rows;
+  int gap     = 14;
+  int padX    = 16;
+  int hoverH  = 50;
+  int gridTop = 44;
+  int gridBottom = H - hoverH - 8;
+  int cellW = (W - 2 * padX - (cols - 1) * gap) / cols;
+  int cellH = (gridBottom - gridTop - (rows - 1) * gap) / rows;
+  int originX = padX;
+  int originY = gridTop;
 
-  int pageStart = (selectedIdx / GRID_PAGE) * GRID_PAGE;
-  int end = min(bookCount, pageStart + GRID_PAGE);
+  int pageStart = (selectedIdx / gridPage) * gridPage;
+  int end = min(bookCount, pageStart + gridPage);
   for (int i = pageStart; i < end; i++) {
     int local = i - pageStart;
-    int col = local % GRID_COLS;
-    int row = local / GRID_COLS;
-    int x = originX + col * (cellW + 16);
-    int y = originY + row * (cellH + 16);
-    drawCard(i, x, y, cellW, cellH, i == selectedIdx);
+    int col = local % cols;
+    int row = local / cols;
+    int xC = originX + col * (cellW + gap);
+    int yC = originY + row * (cellH + gap);
+    drawCard(i, xC, yC, cellW, cellH, i == selectedIdx);
   }
 
-  drawHoverPanel(24, SCREEN_H - 84, SCREEN_W - 48, 76);
-
-  String pos = String(selectedIdx + 1) + " / " + bookCount;
-  epd.drawString(pos, SCREEN_W - 90, 20, 2);
-
+  drawHoverBar(padX, H - hoverH - 4, W - 2 * padX, hoverH);
   epd.update();
 }
 
@@ -567,33 +574,32 @@ static void drawDashboard() {
 // ---------------------------------------------------------------------------
 static void drawReaderViewport(int slot) {
   PageSlot& s = pageCache[slot];
-  int maxScroll = max(0, s.height - SCREEN_H);
+  int W  = currentScreenW();
+  int H  = currentScreenH();
+  int rb = currentRowBytes();
+  int maxScroll = max(0, s.height - H);
   if (readerScrollY < 0) readerScrollY = 0;
   if (readerScrollY > maxScroll) readerScrollY = maxScroll;
 
-  // Bitmap is row-major, 1 bit per pixel, MSB-first; each row is exactly
-  // ROW_BYTES (= SCREEN_W/8 = 100) bytes. Skip `readerScrollY` rows by
-  // offsetting the pointer.
-  uint8_t* offset = s.data + (size_t)readerScrollY * ROW_BYTES;
+  uint8_t* offset = s.data + (size_t)readerScrollY * rb;
   epd.fillScreen(TFT_WHITE);
-  epd.drawBitmap(0, 0, offset, SCREEN_W, SCREEN_H, TFT_WHITE, TFT_BLACK);
+  epd.drawBitmap(0, 0, offset, W, H, TFT_WHITE, TFT_BLACK);
 
-  // Scroll-position indicator (a thin bar on the right) only if the page is
-  // taller than the viewport.
-  if (s.height > SCREEN_H) {
-    int trackH = SCREEN_H - 20;
-    int barH = max(20, (SCREEN_H * trackH) / s.height);
-    int barY = 10 + (maxScroll == 0 ? 0 : (readerScrollY * (trackH - barH)) / maxScroll);
-    epd.fillRect(SCREEN_W - 4, barY, 3, barH, TFT_BLACK);
+  if (s.height > H) {
+    int trackH = H - 20;
+    int barH = max(20, (H * trackH) / s.height);
+    int barY = 10 + (maxScroll == 0
+                         ? 0
+                         : (readerScrollY * (trackH - barH)) / maxScroll);
+    epd.fillRect(W - 4, barY, 3, barH, TFT_BLACK);
   }
 
-  // Tiny page-N-of-M label, bottom-right.
   int pc = books[readerBookIdx].pageCount;
   String label = String(readerPage);
   if (pc > 0) label += " / " + String(pc);
-  epd.fillRect(SCREEN_W - 90, SCREEN_H - 22, 80, 18, TFT_WHITE);
+  epd.fillRect(W - 90, H - 22, 80, 18, TFT_WHITE);
   epd.setTextColor(TFT_BLACK);
-  epd.drawString(label, SCREEN_W - 88, SCREEN_H - 20, 2);
+  epd.drawString(label, W - 88, H - 20, 2);
 
   epd.update();
 }
@@ -604,13 +610,13 @@ static void drawReaderPage() {
     epd.fillScreen(TFT_WHITE);
     epd.setTextColor(TFT_BLACK);
     epd.drawString("Loading page " + String(readerPage) + "...",
-                   40, 220, 4);
+                   40, currentScreenH() / 2, 4);
     epd.update();
     slot = cacheLoad(readerPage);
     if (slot < 0) {
       epd.fillScreen(TFT_WHITE);
       epd.drawString("Couldn't load page " + String(readerPage),
-                     40, 220, 4);
+                     40, currentScreenH() / 2, 4);
       epd.update();
       return;
     }
@@ -680,7 +686,7 @@ static void readerScroll(int delta) {
   int slot = cacheFind(readerPage);
   if (slot < 0) return;
   int newY = readerScrollY + delta;
-  int maxScroll = max(0, pageCache[slot].height - SCREEN_H);
+  int maxScroll = max(0, pageCache[slot].height - currentScreenH());
   if (newY < 0) newY = 0;
   if (newY > maxScroll) newY = maxScroll;
   if (newY == readerScrollY) return;
@@ -689,14 +695,45 @@ static void readerScroll(int delta) {
 }
 
 // ---------------------------------------------------------------------------
+// Orientation toggle
+// ---------------------------------------------------------------------------
+static void applyRotation() {
+  // Rotation 1 = landscape (long edge horizontal, panel ribbon at top).
+  // Rotation 2 = portrait flipped 180° from native — the device's natural
+  // hand-held orientation with the buttons toward the user. The user found
+  // rotation 0 to be the "wrong direction"; this flip puts text right-side
+  // up when held that way.
+  epd.setRotation(orientation == Orientation::Landscape ? 1 : 2);
+}
+
+static void toggleOrientation() {
+  orientation = orientation == Orientation::Landscape
+                    ? Orientation::Portrait
+                    : Orientation::Landscape;
+  applyRotation();
+  // Cached pages are at the old width — drop them so the new orientation
+  // refetches at the right size.
+  cacheReset();
+  readerScrollY = 0;
+  if (screen == Screen::Reader) {
+    drawReaderPage();
+    prefetchAhead(readerPage + 1, READER_PREFETCH_PAGES);
+  } else if (screen == Screen::Dashboard) {
+    drawDashboard();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Boot screens
 // ---------------------------------------------------------------------------
 static void drawBootMessage(const String& msg) {
   epd.fillScreen(TFT_WHITE);
   epd.setTextColor(TFT_BLACK);
-  epd.drawString("trmnl - reader", 24, 16, 4);
-  epd.drawLine(24, 48, SCREEN_W - 24, 48, TFT_BLACK);
-  epd.drawString(msg, 40, 220, 4);
+  int W = currentScreenW();
+  int H = currentScreenH();
+  epd.drawString("trmnl - reader", 16, 8, 4);
+  epd.drawLine(16, 36, W - 16, 36, TFT_BLACK);
+  epd.drawString(msg, 40, H / 2, 4);
   epd.update();
 }
 
@@ -704,10 +741,11 @@ static void drawError(const String& msg) {
   screen = Screen::Error;
   epd.fillScreen(TFT_WHITE);
   epd.setTextColor(TFT_BLACK);
-  epd.drawString("trmnl - reader", 24, 16, 4);
-  epd.drawString("error:", 40, 180, 4);
-  epd.drawString(msg, 40, 220, 4);
-  epd.drawString("(press SELECT to retry)", 40, 260, 2);
+  int H = currentScreenH();
+  epd.drawString("trmnl - reader", 16, 8, 4);
+  epd.drawString("error:", 40, H / 2 - 30, 4);
+  epd.drawString(msg, 40, H / 2 + 10, 4);
+  epd.drawString("(press SELECT to retry)", 40, H / 2 + 50, 2);
   epd.update();
 }
 
@@ -749,28 +787,51 @@ static bool bootSequence() {
 // ---------------------------------------------------------------------------
 // Event loop
 // ---------------------------------------------------------------------------
-static void handleDashboard(BtnEvent ev) {
+// Jump cursor to the next/previous grid page (8 books per page in either
+// orientation), keeping the cursor on the equivalent slot of the new page.
+static void dashboardJumpPage(int dir) {
   if (bookCount == 0) return;
-  if (ev == BtnEvent::PrevShort) {
-    selectedIdx = (selectedIdx - 1 + bookCount) % bookCount;
-    drawDashboard();
-  } else if (ev == BtnEvent::NextShort) {
-    selectedIdx = (selectedIdx + 1) % bookCount;
-    drawDashboard();
-  } else if (ev == BtnEvent::SelectShort) {
-    enterReader(selectedIdx);
+  int page = gridPageSize();
+  int slotInPage = selectedIdx % page;
+  int newIdx = selectedIdx + dir * page;
+  if (newIdx < 0) newIdx = 0;
+  if (newIdx >= bookCount) {
+    int lastPageStart = (bookCount - 1) / page * page;
+    newIdx = min(lastPageStart + slotInPage, bookCount - 1);
   }
-  // long-press in dashboard: ignore
+  if (newIdx == selectedIdx) return;
+  selectedIdx = newIdx;
+  drawDashboard();
+}
+
+static void handleDashboard(BtnEvent ev) {
+  if (ev == BtnEvent::SelectLong) { toggleOrientation(); return; }
+  if (bookCount == 0) return;
+  switch (ev) {
+    case BtnEvent::PrevShort:
+      selectedIdx = (selectedIdx - 1 + bookCount) % bookCount;
+      drawDashboard();
+      break;
+    case BtnEvent::NextShort:
+      selectedIdx = (selectedIdx + 1) % bookCount;
+      drawDashboard();
+      break;
+    case BtnEvent::PrevLong: dashboardJumpPage(-1); break;
+    case BtnEvent::NextLong: dashboardJumpPage(+1); break;
+    case BtnEvent::SelectShort: enterReader(selectedIdx); break;
+    default: break;
+  }
 }
 
 static void handleReader(BtnEvent ev) {
   switch (ev) {
-    case BtnEvent::NextShort:   readerScroll( SCROLL_STEP); break;
-    case BtnEvent::PrevShort:   readerScroll(-SCROLL_STEP); break;
-    case BtnEvent::NextLong:    readerNextPage();           break;
-    case BtnEvent::PrevLong:    readerPrevPage();           break;
-    case BtnEvent::SelectLong:  exitReader();               break;
-    default:                                                break;
+    case BtnEvent::NextShort:   readerScroll( currentScrollStep()); break;
+    case BtnEvent::PrevShort:   readerScroll(-currentScrollStep()); break;
+    case BtnEvent::NextLong:    readerNextPage();                   break;
+    case BtnEvent::PrevLong:    readerPrevPage();                   break;
+    case BtnEvent::SelectShort: exitReader();                       break;
+    case BtnEvent::SelectLong:  toggleOrientation();                break;
+    default:                                                        break;
   }
 }
 
@@ -780,10 +841,9 @@ void setup() {
 
   buttonsInit();
   epd.begin();
-  epd.setRotation(0);
+  applyRotation();
   epd.setTextColor(TFT_BLACK);
 
-  Serial.println("[probe] press each physical button — D4-D7 presses logged");
   bootSequence();
 }
 
